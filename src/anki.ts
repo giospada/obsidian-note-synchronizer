@@ -1,6 +1,7 @@
 import { Notice, requestUrl } from 'obsidian';
 import locale from './lang';
 import Media from './media';
+import Note from './note';
 
 interface Request<P = undefined> {
   action: string;
@@ -15,7 +16,7 @@ interface Response<R = null> {
 
 export class AnkiError extends Error { }
 
-export interface Note {
+export interface AnkiNote {
   deckName: string;
   modelName: string;
   fields: Record<string, string>;
@@ -28,6 +29,7 @@ export interface Note {
 
 class Anki {
   private port = 8765;
+
 
   async invoke<R = null, P = undefined>(action: string, params: P): Promise<R | AnkiError> {
     type requestType = Request<P>;
@@ -70,12 +72,22 @@ class Anki {
     return this.invoke<number>('version', undefined);
   }
 
+  async decks() {
+    return this.invoke<string[]>('deckNames', undefined);
+  }
+
   async noteTypes() {
     return this.invoke<string[]>('modelNames', undefined);
   }
 
   async noteTypesAndIds() {
     return this.invoke<Record<string, number>>('modelNamesAndIds', undefined);
+  }
+
+  async getDecks(cardId: number) {
+    return this.invoke<string[], { cards: number[] }>('getDecks', {
+      cards: [cardId]
+    });
   }
 
   async fields(noteType: string) {
@@ -100,36 +112,23 @@ class Anki {
     });
   }
 
-  async addNote(note: Note) {
-    return this.invoke<number, { note: Note }>('addNote', {
+  async addNote(note: AnkiNote) {
+    return this.invoke<number, { note: AnkiNote }>('addNote', {
       note: note
     });
   }
 
-  async updateFields(id: number, fields: Record<string, string>) {
-    return this.invoke('updateNoteFields', {
+  async updateFields(note:Note,vault:string) {
+    return this.invoke('updateNoteModel', {
       note: {
-        id: id,
-        fields: fields
+        id: note.nid,
+        fields: note.format(vault),
+        modelName: note.typeName,
+        tags: note.tags
       }
     });
   }
 
-  async addTagsToNotes(noteIds: number[], tags: string[]) {
-    const tagstring = tags.join(' ');
-    return this.invoke('addTags', {
-      notes: noteIds,
-      tags: tagstring
-    });
-  }
-
-  async removeTagsFromNotes(noteIds: number[], tags: string[]) {
-    const tagstring = tags.join(' ');
-    return this.invoke('removeTags', {
-      notes: noteIds,
-      tags: tagstring
-    });
-  }
 
   async deleteNotes(noteIds: number[]) {
     return this.invoke('deleteNotes', {

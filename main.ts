@@ -1,12 +1,12 @@
 import { normalizePath, Notice, Plugin } from 'obsidian';
 import Anki, { AnkiError } from 'src/anki';
-import Note, { NoteManager, renderDeckName } from 'src/note';
+import Note, { NoteManager } from 'src/note';
 import { MediaManager } from 'src/media';
 import locale from 'src/lang';
 import { NoteDigest, NoteState, NoteTypeDigest, NoteTypeState } from 'src/state';
 import AnkiSynchronizerSettingTab, { Settings, DEFAULT_SETTINGS } from 'src/setting';
 import { version } from './package.json';
-import { MD5 } from 'object-hash';
+import LoggerSync from 'src/logger';
 
 interface Data {
   version: string;
@@ -55,6 +55,16 @@ export default class AnkiSynchronizer extends Plugin {
       name: locale.synchronizeCommandName,
       callback: async () => await this.synchronize(),
     });
+    this.addCommand({
+      id: "full syncronize",
+      name: locale.synchronizeCommandName,
+      callback: async () => await this.synchronize(true),
+    });
+
+    this.addRibbonIcon(
+      'undo-glyph', "full syinc",
+      async () => await this.synchronize(true)
+    );
 
     if (this.settings.showImportIcon)
       this.addRibbonIcon('enter', locale.importCommandName, async () => await this.importNoteTypes());
@@ -150,14 +160,22 @@ export default class AnkiSynchronizer extends Plugin {
   }
 
 
-  async synchronize() {
+  async synchronize(full = false) {
+    // check anki connection
+    let logger = LoggerSync.getInstance().reset();
+    let decks = await this.anki.decks();
+    if (decks instanceof AnkiError) {
+      new Notice(locale.synchronizeAnkiConnectUnavailableNotice);
+      return;
+    }
+
     const templatesPath = this.getTemplatePath();
     if (templatesPath === undefined) return;
     new Notice(locale.synchronizeStartNotice);
     const allFiles = this.app.vault.getMarkdownFiles();
     // in this case undefined is use as a toy value that means that the
     // note is already added
-    const state = new Map<number, [NoteDigest, Note | undefined]>();
+    const state = new Map<number, NoteDigest>();
     for (const file of allFiles) {
       // ignore templates
       if (file.path.startsWith(templatesPath)) continue;
@@ -165,68 +183,87 @@ export default class AnkiSynchronizer extends Plugin {
       const content = await this.app.vault.cachedRead(file);
       const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter;
       if (!frontmatter) continue;
+      if (frontmatter.nid == undefined) { continue; } // means that is not a note for anki
 
-      if (frontmatter.nid !== undefined && frontmatter.nid !== 0) {
+      if (frontmatter.nid != undefined && frontmatter.nid !== 0) {
         const value = this.noteState.get(frontmatter.nid);
-        const folder = file.parent.path == '/' ? '' : file.parent.path;
-        //TODO Add tags
-        const newValue = {
-          deck: renderDeckName(folder),
-          hash: MD5(content),
-          tags: frontmatter.tags
-        } as NoteDigest;
-        if (value !== undefined && eqNoteDigest(value, newValue)) {
-          console.log(file.basename, 'skipped cached')
-          state.set(frontmatter.nid, [newValue, undefined]);
+        const newValue = this.noteManager.genNoteDigest(file, content);
+        // this is when it get skipped
+        if (value != undefined && value.hash == newValue.hash && !full) {
+          state.set(frontmatter.nid, newValue);
+          logger.cached.push(file.basename);
+          // this is cached
           continue;
         }
-      } else if (frontmatter.nid == undefined) {
-        continue;
       }
-      console.log(file.basename, 'full recreation of the note')
+      // console.log(file.basename, 'full recreation of the note')
       const media = this.app.metadataCache.getFileCache(file)?.embeds;
       if (media) {
         for (const item of media) {
-          this.noteState.handleAddMedia(
+          await this.anki.addMedia(
             this.mediaManager.parseMedia(item, this.app.vault, this.app.metadataCache)
           );
         }
       }
-      const [note, mediaNameMap] = this.noteManager.validateNote(
-        file,
-        frontmatter,
-        content,
-        media,
-        this.noteTypeState
-      );
-      if (!note) continue;
-      if (note.nid === 0) {
-        // new file
-        const nid = await this.noteState.handleAddNote(note);
-        if (nid === undefined) {
-          new Notice(locale.synchronizeAddNoteFailureNotice(file.basename));
-          continue;
+      try {
+        const [note, mediaNameMap] = this.noteManager.createValidateNote(
+          file,
+          frontmatter,
+          content,
+          media,
+          this.noteTypeState
+        );
+        if (!decks.includes(note.folder)) {
+          logger.added_decks.push(file.basename);
+          let res = this.anki.createDeck(note.folder);
+          if (res instanceof AnkiError) {
+            new Notice(locale.synchronizeAddDeckFailureNotice(note.folder));
+            continue;
+          }
+          decks.push(note.folder);
         }
-        note.nid = nid;
-        this.app.vault.modify(file, this.noteManager.dump(note, mediaNameMap));
+
+        if (note.nid === 0) {
+          logger.created_new.push(file.basename);
+          let nid = await this.anki.addNote(note.toAnkiNote(this.app.vault.getName()));
+          if (typeof nid !== 'number') {
+            new Notice(locale.synchronizeAddNoteFailureNotice(file.basename));
+            continue;
+          }
+          note.nid = nid;
+          this.app.vault.modify(file, this.noteManager.dump(note));
+        } else {
+          const value = this.noteState.get(frontmatter.nid);
+          const currentValue = note.digest();
+          if (currentValue.deck != value?.deck) {
+            let res = this.anki.changeDeck([note.nid], note.folder);
+            if (res instanceof AnkiError) {
+              new Notice(locale.synchronizeChangeDeckFailureNotice(note.title()));
+              continue;
+            }
+            logger.changed_deck.push(file.basename);
+          }
+          if (currentValue.hash != value?.hash) {
+            let res = this.anki.updateFields(note, this.app.vault.getName());
+            if (res instanceof AnkiError) {
+              logger.errors.push(file.basename);
+              new Notice(locale.synchronizeUpdateFieldsFailureNotice(note.title()));
+              continue;
+            }
+            logger.modified.push(file.basename);
+          }
+        }
+
+        state.set(note.nid, note.digest());
+      } catch (e) {
+        logger.malformed.push(file.basename);
+        new Notice((e as Error).message);
       }
-      state.set(note.nid, [note.digest(), note]);
     }
     await this.noteState.change(state);
     await this.save();
+    logger.print();
     new Notice(locale.synchronizeSuccessNotice);
   }
 
-}
-function eqNoteDigest(a: NoteDigest, b: NoteDigest): boolean {
-  const arraysEqual = (a: string[], b: string[]) => {
-    if (a === b) return true;
-    if (a == null || b == null) return false;
-    if (a.length !== b.length) return false;
-    for (var i = 0; i < a.length; ++i) {
-      if (a[i] !== b[i]) return false;
-    }
-    return true;
-  }
-  return a.hash === b.hash && a.deck === b.deck && arraysEqual(a.tags, b.tags)
 }
